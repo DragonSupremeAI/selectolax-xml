@@ -8,7 +8,7 @@ from cpython.mem cimport (
     PyMem_RawRealloc
 )
 from enum import IntFlag
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memcmp
 
 _ENCODING = 'UTF-8'
 
@@ -97,7 +97,7 @@ cdef lxb_dom_node_t* _clone_node_into_document(
     return cloned
 
 
-cdef inline void _refresh_head_body(lxb_html_document_t* document):
+cdef inline void _refresh_head_body(lxb_dom_document_t* document):
     """Recompute the cached ``head``/``body`` pointers of a document.
 
     Lexbor caches ``document->head`` and ``document->body`` while building the
@@ -111,20 +111,26 @@ cdef inline void _refresh_head_body(lxb_html_document_t* document):
     Both pointers are reset to ``NULL`` before the tree is scanned, so a document
     that no longer has a ``<head>``/``<body>`` reports them as absent.
 
+    Only meaningful for HTML documents; anything else is ignored.
+
     Returns
     -------
     None
     """
+    cdef lxb_html_document_t* html_doc
     cdef lxb_dom_node_t* html_node
     cdef lxb_dom_node_t* child
 
-    if document == NULL:
+    if document == NULL or document.type != LXB_DOM_DOCUMENT_DTYPE_HTML:
         return
 
-    document.head = NULL
-    document.body = NULL
+    # lxb_html_document_t embeds the DOM document as its first member.
+    html_doc = <lxb_html_document_t *> document
 
-    html_node = document.dom_document.node.first_child
+    html_doc.head = NULL
+    html_doc.body = NULL
+
+    html_node = document.node.first_child
     while html_node != NULL:
         if lxb_dom_node_tag_id_noi(html_node) == LXB_TAG_HTML:
             break
@@ -136,14 +142,14 @@ cdef inline void _refresh_head_body(lxb_html_document_t* document):
     child = html_node.first_child
     while child != NULL:
         if lxb_dom_node_tag_id_noi(child) == LXB_TAG_HEAD:
-            document.head = <lxb_html_head_element_t *> child
+            html_doc.head = <lxb_html_head_element_t *> child
         elif lxb_dom_node_tag_id_noi(child) == LXB_TAG_BODY:
-            document.body = <lxb_html_body_element_t *> child
+            html_doc.body = <lxb_html_body_element_t *> child
         child = child.next
 
 
 cdef inline void _maybe_refresh_head_body(
-    lxb_html_document_t* document, lxb_dom_node_t* removed
+    lxb_dom_document_t* document, lxb_dom_node_t* removed
 ):
     """Re-point a document's cached ``head``/``body`` if ``removed`` was one.
 
@@ -175,12 +181,20 @@ cdef inline void _maybe_refresh_head_body(
     -------
     None
     """
+    cdef lxb_html_document_t* html_doc
+
     if document == NULL or removed == NULL:
         return
 
-    if removed == <lxb_dom_node_t *> document.head:
+    if document.type != LXB_DOM_DOCUMENT_DTYPE_HTML:
+        return
+
+    # lxb_html_document_t embeds the DOM document as its first member.
+    html_doc = <lxb_html_document_t *> document
+
+    if removed == <lxb_dom_node_t *> html_doc.head:
         _refresh_head_body(document)
-    elif removed == <lxb_dom_node_t *> document.body:
+    elif removed == <lxb_dom_node_t *> html_doc.body:
         _refresh_head_body(document)
 
 
@@ -266,14 +280,12 @@ cdef inline list _collect_script_srcs(LexborNode root):
     return srcs
 
 
-cdef class LexborHTMLParser:
-    """The lexbor HTML parser.
+cdef class LexborBaseParser:
+    """Shared document/tree API for the HTML and XML parsers.
 
-    Use this class to parse raw HTML.
-
-    ``raw_html`` holds the bytes that were parsed. That is the UTF-8 form of the
-    input, so for non-UTF-8 input read with ``encoding=True`` it is the
-    transcoded document rather than the bytes that were passed in.
+    Holds the generic ``lxb_dom_document_t`` the node layer operates on plus
+    the per-parser lookup caches. Not meant to be instantiated directly - use
+    :class:`LexborHTMLParser` or :class:`LexborXMLParser`.
 
     Notes
     -----
@@ -281,301 +293,6 @@ cdef class LexborHTMLParser:
     per-parser ``LexborCSSSelector`` races on a free-threaded build, so even
     read-only ``css()`` calls can interfere.
     """
-    def __init__(
-        self,
-        html: str | bytes,
-        is_fragment: bool = False,
-        fragment_tag: str = "div",
-        fragment_namespace: str = "html",
-        options: int = 0,
-        encoding: bool = False,
-        scripting: bool = False,
-    ):
-        """Create a parser and load HTML.
-
-        Parameters
-        ----------
-        html : str or bytes
-            HTML content to parse.
-            Bytes are parsed as UTF-8; see ``encoding`` to have the encoding
-            detected instead.
-        is_fragment : bool, optional
-            When ``False`` (default), the input is parsed as a full HTML document.
-            If the input is only a fragment, the parser still accepts it and inserts any missing required elements,
-            (such as `<html>`, `<head>`, and `<body>`) into the tree,
-            according to the HTML parsing rules in the HTML Standard.
-            This matches how browsers construct the DOM when they load an HTML page.
-
-            When ``True``, the input is parsed as an HTML fragment.
-            The parser does not insert any missing required HTML elements.
-            Behaves the same way as `DocumentFragment` in browsers.
-            When `<html>`, `<head>` or `<body>` are present, ignores them entirely.
-            As per the HTML Standard.
-        fragment_tag : str, optional
-            Context element tag used for fragment parsing. Defaults to ``"div"``.
-            Only used when ``is_fragment`` is ``True``.
-        fragment_namespace : str, optional
-            Context element namespace used for fragment parsing. Defaults to ``"html"``.
-            Accepts Lexbor namespace names such as ``"html"``, ``"svg"``, and ``"math"``,
-            or a namespace URI recognized by Lexbor. Only used when ``is_fragment`` is ``True``.
-        options : int, optional
-            Lexbor document options, a combination of :class:`LexborDocumentOptions` flags.
-            Defaults to ``0``, which enables DOM mutation events.
-            Pass ``options`` only when you need a non-default behaviour.
-
-            Mutation events are the side effects Lexbor applies to the tree after parsing.
-            For example, the HTML Standard has `<selectedcontent>` mirror the selected
-            `<option>`'s content, so by default the parser clones it into place::
-
-                >>> html = (
-                ...     "<select><selectedcontent></selectedcontent>"
-                ...     "<option>this gets cloned</option></select>"
-                ... )
-                >>> LexborHTMLParser(html).css_first("selectedcontent").html
-                '<selectedcontent>this gets cloned</selectedcontent>'
-
-            ``WO_EVENTS`` ("without events") turns that off, so the element keeps
-            whatever the source actually contained::
-
-                >>> LexborHTMLParser(
-                ...     html, options=LexborDocumentOptions.WO_EVENTS
-                ... ).css_first("selectedcontent").html
-                '<selectedcontent></selectedcontent>'
-
-            Reach for it when you want the raw source rather than the browser-normalised
-            tree, for example to round-trip HTML or diff markup between two documents.
-            Leave it at ``0`` when you want a tree that matches what a browser would build.
-
-            Several flags can be combined with the bitwise OR operator::
-
-                LexborDocumentOptions.WO_EVENTS | LexborDocumentOptions.UNDEF
-
-            or by passing the equivalent plain integer::
-
-                LexborDocumentOptions.WO_EVENTS.value | LexborDocumentOptions.UNDEF.value
-
-        encoding : bool, optional
-            Detect the encoding of ``bytes`` input and transcode it to UTF-8
-            before parsing. Defaults to ``False``, which parses bytes as UTF-8.
-
-            Text input is never affected: a ``str`` is already decoded, so there
-            is nothing to detect.
-
-            Detection follows the HTML Standard. A byte-order mark wins over any
-            declaration, and a ``<meta charset>`` or
-            ``<meta http-equiv="content-type" content="...charset=...">``
-            declaration is honoured within the first 1024 bytes, which is where
-            the Standard stops looking. Bytes that are invalid in the detected
-            encoding become U+FFFD rather than being kept as they are::
-
-                >>> raw = '<meta charset="windows-1251"><p>Привет</p>'.encode('windows-1251')
-                >>> LexborHTMLParser(raw).text()
-                '������'
-                >>> LexborHTMLParser(raw, encoding=True).text()
-                'Привет'
-
-            Input that declares nothing is decoded as UTF-8, not as the
-            windows-1252 a browser would fall back to, so that turning this on
-            cannot reinterpret a document that already parsed correctly. A
-            declaration naming something that cannot read text is ignored the
-            same way - an unknown label, or one of the codec module's binary
-            and text-transform pseudo-encodings such as ``base64`` or ``rot13`` -
-            so no page can fail its own parse by choosing one.
-
-            The encoding is resolved before parsing, so this costs one extra pass
-            over non-UTF-8 input and nothing at all for UTF-8.
-
-        scripting : bool, optional
-            Parse the way a browser with scripting enabled does. Defaults to
-            ``False``, the way a browser with scripting disabled does.
-
-            The HTML Standard parses ``<noscript>`` by this flag. With scripting
-            disabled, its content is parsed as markup, so a ``<noscript>`` in
-            ``<head>`` that holds an element ``<head>`` does not allow, such as a
-            tracking ``<img>``, closes ``<head>``, and every head element after
-            it ends up in ``<body>``::
-
-                >>> html = (
-                ...     '<head><noscript><img src="p.gif"></noscript>'
-                ...     '<link rel="canonical" href="/a"></head>'
-                ... )
-                >>> LexborHTMLParser(html).css_first("head link") is None
-                True
-
-            With scripting enabled, as in a browser that runs scripts, the
-            content of ``<noscript>`` is one text node, and the head elements
-            after it stay in ``<head>``::
-
-                >>> parser = LexborHTMLParser(html, scripting=True)
-                >>> parser.css_first("head link").attributes["href"]
-                '/a'
-
-            The flag also applies to HTML parsed into the document later, such
-            as an ``inner_html`` assignment, and :meth:`clone` keeps it.
-
-        """
-        cdef size_t html_len
-        cdef object bytes_html
-
-        self._is_fragment = is_fragment
-        self._fragment_wrapper = NULL
-        self._fragment_tag_id = LXB_TAG_DIV
-        self._fragment_namespace_id = LXB_NS_HTML
-        self._selector = None
-        self._new_html_document()
-        lxb_html_document_dom_opt_set(self.document, <lxb_dom_document_opt_t> int(options))
-        lxb_html_document_scripting_set(self.document, scripting)
-
-        if self._is_fragment:
-            self._fragment_tag_id = _fragment_tag_id_from_string(self.document, fragment_tag)
-            self._fragment_namespace_id = _fragment_namespace_id_from_string(self.document, fragment_namespace)
-        bytes_html, html_len = preprocess_input(html, encoding=encoding)
-        self._parse_html(bytes_html, html_len)
-        self.raw_html = bytes_html
-
-    cdef inline void _new_html_document(self):
-        """Initialize a fresh Lexbor HTML document.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        SelectolaxError
-            If the underlying Lexbor document cannot be created.
-        """
-        with nogil:
-            self.document = lxb_html_document_create()
-
-        if self.document == NULL:
-            PyErr_SetObject(SelectolaxError, "Failed to initialize object for HTML Document.")
-
-    cdef int _parse_html(self, char *html, size_t html_len) except -1:
-        """Parse HTML content into the internal document.
-
-        Parameters
-        ----------
-        html : char *
-            Pointer to UTF-8 encoded HTML bytes.
-        html_len : size_t
-            Length of the HTML buffer.
-
-        Returns
-        -------
-        int
-            ``0`` on success; ``-1`` when parsing fails.
-
-        Raises
-        ------
-        SelectolaxError
-            If Lexbor returns a non-OK status.
-        RuntimeError
-            If the internal document is ``NULL`` after a successful parse.
-        """
-        cdef lxb_status_t status
-
-        if self.document == NULL:
-            return -1
-
-        with nogil:
-            if self._is_fragment:
-                status = self._parse_html_fragment(html, html_len)
-            else:
-                status = self._parse_html_document(html, html_len)
-
-        if status != LXB_STATUS_OK:
-            PyErr_SetObject(SelectolaxError, "Can't parse HTML.")
-            return -1
-
-        if self.document == NULL:
-            PyErr_SetObject(RuntimeError, "document is NULL even after html was parsed correctly")
-            return -1
-        return 0
-
-    cdef inline lxb_status_t _parse_html_document(self, char *html, size_t html_len) noexcept nogil:
-        """Parse HTML as a full HTML document.
-        If the input is only a fragment, the parser still accepts it and inserts any missing required elements,
-        (such as `<html>`, `<head>`, and `<body>`) into the tree,
-        according to the HTML parsing rules in the HTML Standard.
-        This matches how browsers construct the DOM when they load an HTML page.
-
-        Parameters
-        ----------
-        html : char *
-            Pointer to UTF-8 encoded HTML bytes.
-        html_len : size_t
-            Length of the HTML buffer.
-
-        Returns
-        -------
-        lxb_status_t
-            Lexbor status code produced by ``lxb_html_document_parse``.
-        """
-        return lxb_html_document_parse(self.document, <lxb_char_t *> html, html_len)
-
-    cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(
-        self, char *html, size_t html_len, lxb_status_t *out_status
-    ) noexcept nogil:
-        """Parse a fragment with this parser's context and return its wrapper.
-
-        The wrapper is the internal ``<html>`` element holding the fragment's
-        top-level nodes. It and its contents are owned by this parser's document:
-        fragment parsing borrows a transient child document that shares the
-        parent's pools, so destroying the parser here is safe. ``out_status`` is
-        always set. A parse that yields no nodes still returns a wrapper - an
-        empty fragment has one too.
-        """
-        cdef lxb_html_parser_t *parser = NULL
-        cdef lxb_dom_node_t *fragment_html_node = NULL
-        cdef lxb_status_t status = LXB_STATUS_OK
-
-        parser = lxb_html_parser_create()
-        if parser == NULL:
-            out_status[0] = LXB_STATUS_ERROR_MEMORY_ALLOCATION
-            return NULL
-
-        status = lxb_html_parser_init(parser)
-        if status != LXB_STATUS_OK:
-            lxb_html_parser_destroy(parser)
-            out_status[0] = status
-            return NULL
-
-        fragment_html_node = lxb_html_parse_fragment_by_tag_id(
-            parser,
-            self.document,
-            self._fragment_tag_id,
-            self._fragment_namespace_id,
-            <lxb_char_t *> html,
-            html_len
-        )
-        if fragment_html_node == NULL:
-            # Read the status before destroying the parser that owns it.
-            status = parser.status
-            lxb_html_parser_destroy(parser)
-            if status == LXB_STATUS_OK:
-                status = LXB_STATUS_ERROR
-            out_status[0] = status
-            return NULL
-
-        lxb_html_parser_destroy(parser)
-        out_status[0] = LXB_STATUS_OK
-        return fragment_html_node
-
-    cdef inline lxb_status_t _parse_html_fragment(self, char *html, size_t html_len) noexcept nogil:
-        """Parse HTML as an HTML fragment, keeping the wrapper it is built under.
-
-        No missing required elements are inserted.
-        """
-        cdef lxb_status_t status = LXB_STATUS_OK
-        cdef lxb_dom_node_t *fragment_html_node
-
-        fragment_html_node = self._parse_fragment_wrapper_noi(
-            html, html_len, &status
-        )
-        if fragment_html_node != NULL:
-            self._fragment_wrapper = fragment_html_node
-        return status
 
     cdef inline lxb_dom_node_t* _fragment_root_node(self):
         """Return the fragment's current top-level root node.
@@ -620,7 +337,7 @@ cdef class LexborHTMLParser:
         if self._fragment_wrapper != NULL:
             return self._fragment_wrapper
 
-        return <lxb_dom_node_t *> self.document
+        return <lxb_dom_node_t *> self.dom
 
     cdef inline LexborNode _fragment_content_node(self):
         """Return a view of the wrapper that holds the fragment's top-level nodes.
@@ -650,7 +367,20 @@ cdef class LexborHTMLParser:
         if self._fragment_wrapper == NULL:
             raise SelectolaxError("Can't set inner HTML.")
 
-        wrapper = self._parse_fragment_wrapper_noi(
+        if self.dom.type == LXB_DOM_DOCUMENT_DTYPE_XML:
+            while self._fragment_wrapper.first_child != NULL:
+                lxb_dom_node_remove(self._fragment_wrapper.first_child)
+
+            status = lxb_xml_parse_fragment_into(
+                self.dom, self._fragment_wrapper, html, html_len
+            )
+            if status != LXB_STATUS_OK:
+                raise SelectolaxError("Can't set inner HTML.")
+
+            self._mark_mutated()
+            return
+
+        wrapper = (<LexborHTMLParser> self)._parse_fragment_wrapper_noi(
             <char *> html, html_len, &status
         )
         if wrapper == NULL:
@@ -669,7 +399,7 @@ cdef class LexborHTMLParser:
         # Built by the parse above and never handed to the caller.
         lxb_dom_node_destroy(wrapper)
 
-        _refresh_head_body(self.document)
+        _refresh_head_body(self.dom)
         self._mark_mutated()
 
     cdef inline void _mark_mutated(self) noexcept:
@@ -703,20 +433,6 @@ cdef class LexborHTMLParser:
         """
         self._mutation_count += 1
 
-    def __dealloc__(self):
-        """Release the underlying Lexbor HTML document.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        Safe to call multiple times; does nothing if the document is already
-        freed.
-        """
-        if self.document != NULL:
-            lxb_html_document_destroy(self.document)
 
     def __repr__(self):
         """Return a concise representation of the parsed document.
@@ -727,7 +443,7 @@ cdef class LexborHTMLParser:
             A string showing the number of characters in the parsed HTML.
         """
         html_len = len(self.root.html if self.root is not None else "")
-        return f"<LexborHTMLParser chars='{html_len}'>"
+        return f"<{type(self).__name__} chars='{html_len}'>"
 
     @property
     def selector(self):
@@ -742,16 +458,6 @@ cdef class LexborHTMLParser:
             self._selector = LexborCSSSelector()
         return self._selector
 
-    @property
-    def options(self):
-        """Return the Lexbor document options for this parser.
-
-        Returns
-        -------
-        LexborDocumentOptions
-            The options currently set on the underlying Lexbor document.
-        """
-        return LexborDocumentOptions(lxb_html_document_dom_opt(self.document))
 
     @property
     def root(self):
@@ -767,14 +473,14 @@ cdef class LexborHTMLParser:
         LexborNode or None
             Root of the parsed document, or ``None`` if unavailable.
         """
-        if self.document == NULL:
+        if self.dom == NULL:
             return None
         cdef LexborNode  node
         cdef lxb_dom_node_t* dom_root
         if self._is_fragment:
             dom_root = self._fragment_root_node()
         else:
-            dom_root = lxb_dom_document_root(&self.document.dom_document)
+            dom_root = lxb_dom_document_root(self.dom)
         if dom_root == NULL:
             return None
         node =  LexborNode.new(dom_root, self)
@@ -782,49 +488,6 @@ cdef class LexborHTMLParser:
             node.set_as_fragment_root()
         return node
 
-    @property
-    def body(self):
-        """Return document body.
-
-        Reflects the current tree: returns ``None`` once the ``<body>`` has been
-        removed from the document, for example by ``unwrap()``,
-        ``unwrap_tags()``, ``strip_tags()``, ``decompose()`` or
-        ``replace_with()``.
-
-        Returns
-        -------
-        LexborNode or None
-            ``<body>`` element when present, otherwise ``None``.
-        """
-        cdef lxb_html_body_element_t* body
-        if self.document == NULL:
-            return None
-        body = lxb_html_document_body_element_noi(self.document)
-        if body == NULL:
-            return None
-        return LexborNode.new(<lxb_dom_node_t *> body, self)
-
-    @property
-    def head(self):
-        """Return document head.
-
-        Reflects the current tree: returns ``None`` once the ``<head>`` has
-        been removed from the document, for example by ``unwrap()``,
-        ``unwrap_tags()``, ``strip_tags()``, ``decompose()`` or
-        ``replace_with()``.
-
-        Returns
-        -------
-        LexborNode or None
-            ``<head>`` element when present, otherwise ``None``.
-        """
-        cdef lxb_html_head_element_t* head
-        if self.document == NULL:
-            return None
-        head = lxb_html_document_head_element_noi(self.document)
-        if head == NULL:
-            return None
-        return LexborNode.new(<lxb_dom_node_t *> head, self)
 
     def tags(self, str name):
         """Return all tags that match the provided name.
@@ -857,7 +520,7 @@ cdef class LexborHTMLParser:
         pybyte_name = name.encode('UTF-8')
 
         result = list()
-        collection = lxb_dom_collection_make(&self.document.dom_document, 128)
+        collection = lxb_dom_collection_make(self.dom, 128)
 
         if collection == NULL:
             return result
@@ -920,13 +583,13 @@ cdef class LexborHTMLParser:
         str or None
             Serialized HTML of the current document.
         """
-        if self.document == NULL:
+        if self.dom == NULL:
             return None
         if self._is_fragment:
             if self.root is None:
                 return ""
             return self.root.html
-        node = LexborNode.new(<lxb_dom_node_t *> &self.document.dom_document, self)
+        node = LexborNode.new(<lxb_dom_node_t *> self.dom, self)
         return node.html
 
     def html_pretty(
@@ -965,7 +628,7 @@ cdef class LexborHTMLParser:
             Serialize using Lexbor's HTML5 test formatting mode.
         """
         cdef lxb_html_serialize_opt_t options
-        if self.document == NULL:
+        if self.dom == NULL:
             return None
         if indent < 0:
             raise ValueError("indent must be greater than or equal to 0")
@@ -993,7 +656,7 @@ cdef class LexborHTMLParser:
                 full_doctype=full_doctype,
                 html5test=html5test,
             )
-        node = LexborNode.new(<lxb_dom_node_t *> &self.document.dom_document, self)
+        node = LexborNode.new(<lxb_dom_node_t *> self.dom, self)
         return node._serialize_html(options, <size_t> indent, True)
 
     def css(self, str query):
@@ -1073,7 +736,7 @@ cdef class LexborHTMLParser:
         for tag in tags:
             pybyte_name = tag.encode('UTF-8')
 
-            collection = lxb_dom_collection_make(&self.document.dom_document, 128)
+            collection = lxb_dom_collection_make(self.dom, 128)
 
             if collection == NULL:
                 raise SelectolaxError("Can't initialize DOM collection.")
@@ -1094,7 +757,7 @@ cdef class LexborHTMLParser:
                     node_remove_deep(<lxb_dom_node_t *> element)
                 else:
                     lxb_dom_node_remove(<lxb_dom_node_t *> element)
-                _maybe_refresh_head_body(self.document, <lxb_dom_node_t *> element)
+                _maybe_refresh_head_body(self.dom, <lxb_dom_node_t *> element)
             lxb_dom_collection_destroy(collection, <bint> True)
 
         self._mark_mutated()
@@ -1261,98 +924,6 @@ cdef class LexborHTMLParser:
             return
         return node.merge_text_nodes()
 
-    @staticmethod
-    cdef LexborHTMLParser from_document(lxb_html_document_t *document, bytes raw_html):
-        """Construct a parser from an existing Lexbor document.
-
-        Parameters
-        ----------
-        document : lxb_html_document_t *
-            Borrowed pointer to an initialized Lexbor HTML document.
-        raw_html : bytes
-            Original HTML bytes backing the document.
-
-        Returns
-        -------
-        LexborHTMLParser
-            Parser instance wrapping the provided document.
-        """
-        obj = <LexborHTMLParser> LexborHTMLParser.__new__(LexborHTMLParser)
-        obj.document = document
-        obj.raw_html = raw_html
-        obj.cached_script_texts = None
-        obj.cached_script_srcs = None
-        obj._is_fragment = False
-        obj._fragment_wrapper = NULL
-        obj._fragment_tag_id = LXB_TAG_DIV
-        obj._fragment_namespace_id = LXB_NS_HTML
-        obj._selector = None
-        return obj
-
-    def clone(self):
-        """Clone the current document tree.
-
-        You can use to do temporary modifications without affecting the original HTML tree.
-        It is tied to the current parser instance.
-        Gets destroyed when the parser instance is destroyed.
-        Document options and the ``scripting`` flag are preserved in the cloned parser.
-        The document ``head`` and ``body`` are preserved when available.
-
-        Returns
-        -------
-        LexborHTMLParser
-            A parser instance backed by a deep-copied document.
-        """
-        cdef lxb_html_document_t* cloned_document
-        cdef lxb_dom_node_t* cloned_node
-        cdef lxb_dom_node_t* source_child
-        cdef lxb_dom_node_t* next_child
-        cdef LexborHTMLParser cls
-
-        with nogil:
-            cloned_document = lxb_html_document_create()
-
-        if cloned_document == NULL:
-            raise SelectolaxError("Can't create a new document")
-
-        try:
-            lxb_html_document_dom_opt_set(
-                cloned_document, lxb_html_document_dom_opt(self.document)
-            )
-            lxb_html_document_scripting_set(
-                cloned_document, lxb_html_document_scripting(self.document)
-            )
-
-            cloned_document.ready_state = LXB_HTML_DOCUMENT_READY_STATE_COMPLETE
-
-            cloned_node = NULL
-
-            if self._is_fragment:
-                if self._fragment_root_node() != NULL:
-                    cloned_node = _clone_node_into_document(
-                        cloned_document, self._fragment_wrapper
-                    )
-            else:
-                source_child = self.document.dom_document.node.first_child
-                while source_child != NULL:
-                    next_child = source_child.next
-                    cloned_node = _clone_node_into_document(cloned_document, source_child)
-                    source_child = next_child
-
-                _refresh_head_body(cloned_document)
-
-            cls = LexborHTMLParser.from_document(cloned_document, self.raw_html)
-        except BaseException:
-            # Ownership of the document only moves to cls once it exists.
-            lxb_html_document_destroy(cloned_document)
-            raise
-
-        if self._is_fragment:
-            cls._is_fragment = True
-            cls._fragment_tag_id = self._fragment_tag_id
-            cls._fragment_namespace_id = self._fragment_namespace_id
-            cls._fragment_wrapper = cloned_node
-        return cls
 
     def unwrap_tags(self, list tags, delete_empty = False):
         """Unwraps specified tags from the HTML tree.
@@ -1380,7 +951,7 @@ cdef class LexborHTMLParser:
         """
         # faster to check if the document is empty which should determine if we have a root
         cdef LexborNode node
-        if self.document != NULL:
+        if self.dom != NULL:
             node = self.root
             if node is not None:
                 node.unwrap_tags(tags, delete_empty=delete_empty)
@@ -1506,6 +1077,482 @@ cdef class LexborHTMLParser:
             html5test=html5test,
         )
 
+cdef class LexborHTMLParser(LexborBaseParser):
+    """The lexbor HTML parser.
+
+    Use this class to parse raw HTML.
+
+    ``raw_html`` holds the bytes that were parsed. That is the UTF-8 form of the
+    input, so for non-UTF-8 input read with ``encoding=True`` it is the
+    transcoded document rather than the bytes that were passed in.
+
+    Notes
+    -----
+    Not thread-safe: use one parser per thread, or lock the parser. The shared
+    per-parser ``LexborCSSSelector`` races on a free-threaded build, so even
+    read-only ``css()`` calls can interfere.
+    """
+    def __init__(
+        self,
+        html: str | bytes,
+        is_fragment: bool = False,
+        fragment_tag: str = "div",
+        fragment_namespace: str = "html",
+        options: int = 0,
+        encoding: bool = False,
+        scripting: bool = False,
+    ):
+        """Create a parser and load HTML.
+
+        Parameters
+        ----------
+        html : str or bytes
+            HTML content to parse.
+            Bytes are parsed as UTF-8; see ``encoding`` to have the encoding
+            detected instead.
+        is_fragment : bool, optional
+            When ``False`` (default), the input is parsed as a full HTML document.
+            If the input is only a fragment, the parser still accepts it and inserts any missing required elements,
+            (such as `<html>`, `<head>`, and `<body>`) into the tree,
+            according to the HTML parsing rules in the HTML Standard.
+            This matches how browsers construct the DOM when they load an HTML page.
+
+            When ``True``, the input is parsed as an HTML fragment.
+            The parser does not insert any missing required HTML elements.
+            Behaves the same way as `DocumentFragment` in browsers.
+            When `<html>`, `<head>` or `<body>` are present, ignores them entirely.
+            As per the HTML Standard.
+        fragment_tag : str, optional
+            Context element tag used for fragment parsing. Defaults to ``"div"``.
+            Only used when ``is_fragment`` is ``True``.
+        fragment_namespace : str, optional
+            Context element namespace used for fragment parsing. Defaults to ``"html"``.
+            Accepts Lexbor namespace names such as ``"html"``, ``"svg"``, and ``"math"``,
+            or a namespace URI recognized by Lexbor. Only used when ``is_fragment`` is ``True``.
+        options : int, optional
+            Lexbor document options, a combination of :class:`LexborDocumentOptions` flags.
+            Defaults to ``0``, which enables DOM mutation events.
+            Pass ``options`` only when you need a non-default behaviour.
+
+            Mutation events are the side effects Lexbor applies to the tree after parsing.
+            For example, the HTML Standard has `<selectedcontent>` mirror the selected
+            `<option>`'s content, so by default the parser clones it into place::
+
+                >>> html = (
+                ...     "<select><selectedcontent></selectedcontent>"
+                ...     "<option>this gets cloned</option></select>"
+                ... )
+                >>> LexborHTMLParser(html).css_first("selectedcontent").html
+                '<selectedcontent>this gets cloned</selectedcontent>'
+
+            ``WO_EVENTS`` ("without events") turns that off, so the element keeps
+            whatever the source actually contained::
+
+                >>> LexborHTMLParser(
+                ...     html, options=LexborDocumentOptions.WO_EVENTS
+                ... ).css_first("selectedcontent").html
+                '<selectedcontent></selectedcontent>'
+
+            Reach for it when you want the raw source rather than the browser-normalised
+            tree, for example to round-trip HTML or diff markup between two documents.
+            Leave it at ``0`` when you want a tree that matches what a browser would build.
+
+            Several flags can be combined with the bitwise OR operator::
+
+                LexborDocumentOptions.WO_EVENTS | LexborDocumentOptions.UNDEF
+
+            or by passing the equivalent plain integer::
+
+                LexborDocumentOptions.WO_EVENTS.value | LexborDocumentOptions.UNDEF.value
+
+        encoding : bool, optional
+            Detect the encoding of ``bytes`` input and transcode it to UTF-8
+            before parsing. Defaults to ``False``, which parses bytes as UTF-8.
+
+            Text input is never affected: a ``str`` is already decoded, so there
+            is nothing to detect.
+
+            Detection follows the HTML Standard. A byte-order mark wins over any
+            declaration, and a ``<meta charset>`` or
+            ``<meta http-equiv="content-type" content="...charset=...">``
+            declaration is honoured within the first 1024 bytes, which is where
+            the Standard stops looking. Bytes that are invalid in the detected
+            encoding become U+FFFD rather than being kept as they are::
+
+                >>> raw = '<meta charset="windows-1251"><p>Привет</p>'.encode('windows-1251')
+                >>> LexborHTMLParser(raw).text()
+                '������'
+                >>> LexborHTMLParser(raw, encoding=True).text()
+                'Привет'
+
+            Input that declares nothing is decoded as UTF-8, not as the
+            windows-1252 a browser would fall back to, so that turning this on
+            cannot reinterpret a document that already parsed correctly. A
+            declaration naming something that cannot read text is ignored the
+            same way - an unknown label, or one of the codec module's binary
+            and text-transform pseudo-encodings such as ``base64`` or ``rot13`` -
+            so no page can fail its own parse by choosing one.
+
+            The encoding is resolved before parsing, so this costs one extra pass
+            over non-UTF-8 input and nothing at all for UTF-8.
+
+        scripting : bool, optional
+            Parse the way a browser with scripting enabled does. Defaults to
+            ``False``, the way a browser with scripting disabled does.
+
+            The HTML Standard parses ``<noscript>`` by this flag. With scripting
+            disabled, its content is parsed as markup, so a ``<noscript>`` in
+            ``<head>`` that holds an element ``<head>`` does not allow, such as a
+            tracking ``<img>``, closes ``<head>``, and every head element after
+            it ends up in ``<body>``::
+
+                >>> html = (
+                ...     '<head><noscript><img src="p.gif"></noscript>'
+                ...     '<link rel="canonical" href="/a"></head>'
+                ... )
+                >>> LexborHTMLParser(html).css_first("head link") is None
+                True
+
+            With scripting enabled, as in a browser that runs scripts, the
+            content of ``<noscript>`` is one text node, and the head elements
+            after it stay in ``<head>``::
+
+                >>> parser = LexborHTMLParser(html, scripting=True)
+                >>> parser.css_first("head link").attributes["href"]
+                '/a'
+
+            The flag also applies to HTML parsed into the document later, such
+            as an ``inner_html`` assignment, and :meth:`clone` keeps it.
+
+        """
+        cdef size_t html_len
+        cdef object bytes_html
+
+        self._is_fragment = is_fragment
+        self._fragment_wrapper = NULL
+        self._fragment_tag_id = LXB_TAG_DIV
+        self._fragment_namespace_id = LXB_NS_HTML
+        self._selector = None
+        self._new_html_document()
+        self.dom = &self.document.dom_document
+        lxb_html_document_dom_opt_set(self.document, <lxb_dom_document_opt_t> int(options))
+        lxb_html_document_scripting_set(self.document, scripting)
+
+        if self._is_fragment:
+            self._fragment_tag_id = _fragment_tag_id_from_string(self.document, fragment_tag)
+            self._fragment_namespace_id = _fragment_namespace_id_from_string(self.document, fragment_namespace)
+        bytes_html, html_len = preprocess_input(html, encoding=encoding)
+        self._parse_html(bytes_html, html_len)
+        self.raw_html = bytes_html
+
+    cdef inline void _new_html_document(self):
+        """Initialize a fresh Lexbor HTML document.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        SelectolaxError
+            If the underlying Lexbor document cannot be created.
+        """
+        with nogil:
+            self.document = lxb_html_document_create()
+
+        if self.document == NULL:
+            PyErr_SetObject(SelectolaxError, "Failed to initialize object for HTML Document.")
+
+    cdef int _parse_html(self, char *html, size_t html_len) except -1:
+        """Parse HTML content into the internal document.
+
+        Parameters
+        ----------
+        html : char *
+            Pointer to UTF-8 encoded HTML bytes.
+        html_len : size_t
+            Length of the HTML buffer.
+
+        Returns
+        -------
+        int
+            ``0`` on success; ``-1`` when parsing fails.
+
+        Raises
+        ------
+        SelectolaxError
+            If Lexbor returns a non-OK status.
+        RuntimeError
+            If the internal document is ``NULL`` after a successful parse.
+        """
+        cdef lxb_status_t status
+
+        if self.document == NULL:
+            return -1
+
+        with nogil:
+            if self._is_fragment:
+                status = self._parse_html_fragment(html, html_len)
+            else:
+                status = self._parse_html_document(html, html_len)
+
+        if status != LXB_STATUS_OK:
+            PyErr_SetObject(SelectolaxError, "Can't parse HTML.")
+            return -1
+
+        if self.document == NULL:
+            PyErr_SetObject(RuntimeError, "document is NULL even after html was parsed correctly")
+            return -1
+        return 0
+
+    cdef inline lxb_status_t _parse_html_document(self, char *html, size_t html_len) noexcept nogil:
+        """Parse HTML as a full HTML document.
+        If the input is only a fragment, the parser still accepts it and inserts any missing required elements,
+        (such as `<html>`, `<head>`, and `<body>`) into the tree,
+        according to the HTML parsing rules in the HTML Standard.
+        This matches how browsers construct the DOM when they load an HTML page.
+
+        Parameters
+        ----------
+        html : char *
+            Pointer to UTF-8 encoded HTML bytes.
+        html_len : size_t
+            Length of the HTML buffer.
+
+        Returns
+        -------
+        lxb_status_t
+            Lexbor status code produced by ``lxb_html_document_parse``.
+        """
+        return lxb_html_document_parse(self.document, <lxb_char_t *> html, html_len)
+
+    cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(
+        self, char *html, size_t html_len, lxb_status_t *out_status
+    ) noexcept nogil:
+        """Parse a fragment with this parser's context and return its wrapper.
+
+        The wrapper is the internal ``<html>`` element holding the fragment's
+        top-level nodes. It and its contents are owned by this parser's document:
+        fragment parsing borrows a transient child document that shares the
+        parent's pools, so destroying the parser here is safe. ``out_status`` is
+        always set. A parse that yields no nodes still returns a wrapper - an
+        empty fragment has one too.
+        """
+        cdef lxb_html_parser_t *parser = NULL
+        cdef lxb_dom_node_t *fragment_html_node = NULL
+        cdef lxb_status_t status = LXB_STATUS_OK
+
+        parser = lxb_html_parser_create()
+        if parser == NULL:
+            out_status[0] = LXB_STATUS_ERROR_MEMORY_ALLOCATION
+            return NULL
+
+        status = lxb_html_parser_init(parser)
+        if status != LXB_STATUS_OK:
+            lxb_html_parser_destroy(parser)
+            out_status[0] = status
+            return NULL
+
+        fragment_html_node = lxb_html_parse_fragment_by_tag_id(
+            parser,
+            self.document,
+            self._fragment_tag_id,
+            self._fragment_namespace_id,
+            <lxb_char_t *> html,
+            html_len
+        )
+        if fragment_html_node == NULL:
+            # Read the status before destroying the parser that owns it.
+            status = parser.status
+            lxb_html_parser_destroy(parser)
+            if status == LXB_STATUS_OK:
+                status = LXB_STATUS_ERROR
+            out_status[0] = status
+            return NULL
+
+        lxb_html_parser_destroy(parser)
+        out_status[0] = LXB_STATUS_OK
+        return fragment_html_node
+
+    cdef inline lxb_status_t _parse_html_fragment(self, char *html, size_t html_len) noexcept nogil:
+        """Parse HTML as an HTML fragment, keeping the wrapper it is built under.
+
+        No missing required elements are inserted.
+        """
+        cdef lxb_status_t status = LXB_STATUS_OK
+        cdef lxb_dom_node_t *fragment_html_node
+
+        fragment_html_node = self._parse_fragment_wrapper_noi(
+            html, html_len, &status
+        )
+        if fragment_html_node != NULL:
+            self._fragment_wrapper = fragment_html_node
+        return status
+
+    def __dealloc__(self):
+        """Release the underlying Lexbor HTML document.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Safe to call multiple times; does nothing if the document is already
+        freed.
+        """
+        if self.document != NULL:
+            lxb_html_document_destroy(self.document)
+
+    @property
+    def options(self):
+        """Return the Lexbor document options for this parser.
+
+        Returns
+        -------
+        LexborDocumentOptions
+            The options currently set on the underlying Lexbor document.
+        """
+        return LexborDocumentOptions(lxb_html_document_dom_opt(self.document))
+
+    @property
+    def body(self):
+        """Return document body.
+
+        Reflects the current tree: returns ``None`` once the ``<body>`` has been
+        removed from the document, for example by ``unwrap()``,
+        ``unwrap_tags()``, ``strip_tags()``, ``decompose()`` or
+        ``replace_with()``.
+
+        Returns
+        -------
+        LexborNode or None
+            ``<body>`` element when present, otherwise ``None``.
+        """
+        cdef lxb_html_body_element_t* body
+        if self.document == NULL:
+            return None
+        body = lxb_html_document_body_element_noi(self.document)
+        if body == NULL:
+            return None
+        return LexborNode.new(<lxb_dom_node_t *> body, self)
+
+    @property
+    def head(self):
+        """Return document head.
+
+        Reflects the current tree: returns ``None`` once the ``<head>`` has
+        been removed from the document, for example by ``unwrap()``,
+        ``unwrap_tags()``, ``strip_tags()``, ``decompose()`` or
+        ``replace_with()``.
+
+        Returns
+        -------
+        LexborNode or None
+            ``<head>`` element when present, otherwise ``None``.
+        """
+        cdef lxb_html_head_element_t* head
+        if self.document == NULL:
+            return None
+        head = lxb_html_document_head_element_noi(self.document)
+        if head == NULL:
+            return None
+        return LexborNode.new(<lxb_dom_node_t *> head, self)
+
+    @staticmethod
+    cdef LexborHTMLParser from_document(lxb_html_document_t *document, bytes raw_html):
+        """Construct a parser from an existing Lexbor document.
+
+        Parameters
+        ----------
+        document : lxb_html_document_t *
+            Borrowed pointer to an initialized Lexbor HTML document.
+        raw_html : bytes
+            Original HTML bytes backing the document.
+
+        Returns
+        -------
+        LexborHTMLParser
+            Parser instance wrapping the provided document.
+        """
+        obj = <LexborHTMLParser> LexborHTMLParser.__new__(LexborHTMLParser)
+        obj.document = document
+        obj.dom = &document.dom_document
+        obj.raw_html = raw_html
+        obj.cached_script_texts = None
+        obj.cached_script_srcs = None
+        obj._is_fragment = False
+        obj._fragment_wrapper = NULL
+        obj._fragment_tag_id = LXB_TAG_DIV
+        obj._fragment_namespace_id = LXB_NS_HTML
+        obj._selector = None
+        return obj
+
+    def clone(self):
+        """Clone the current document tree.
+
+        You can use to do temporary modifications without affecting the original HTML tree.
+        It is tied to the current parser instance.
+        Gets destroyed when the parser instance is destroyed.
+        Document options and the ``scripting`` flag are preserved in the cloned parser.
+        The document ``head`` and ``body`` are preserved when available.
+
+        Returns
+        -------
+        LexborHTMLParser
+            A parser instance backed by a deep-copied document.
+        """
+        cdef lxb_html_document_t* cloned_document
+        cdef lxb_dom_node_t* cloned_node
+        cdef lxb_dom_node_t* source_child
+        cdef lxb_dom_node_t* next_child
+        cdef LexborHTMLParser cls
+
+        with nogil:
+            cloned_document = lxb_html_document_create()
+
+        if cloned_document == NULL:
+            raise SelectolaxError("Can't create a new document")
+
+        try:
+            lxb_html_document_dom_opt_set(
+                cloned_document, lxb_html_document_dom_opt(self.document)
+            )
+            lxb_html_document_scripting_set(
+                cloned_document, lxb_html_document_scripting(self.document)
+            )
+
+            cloned_document.ready_state = LXB_HTML_DOCUMENT_READY_STATE_COMPLETE
+
+            cloned_node = NULL
+
+            if self._is_fragment:
+                if self._fragment_root_node() != NULL:
+                    cloned_node = _clone_node_into_document(
+                        cloned_document, self._fragment_wrapper
+                    )
+            else:
+                source_child = self.document.dom_document.node.first_child
+                while source_child != NULL:
+                    next_child = source_child.next
+                    cloned_node = _clone_node_into_document(cloned_document, source_child)
+                    source_child = next_child
+
+                _refresh_head_body(&cloned_document.dom_document)
+
+            cls = LexborHTMLParser.from_document(cloned_document, self.raw_html)
+        except BaseException:
+            # Ownership of the document only moves to cls once it exists.
+            lxb_html_document_destroy(cloned_document)
+            raise
+
+        if self._is_fragment:
+            cls._is_fragment = True
+            cls._fragment_tag_id = self._fragment_tag_id
+            cls._fragment_namespace_id = self._fragment_namespace_id
+            cls._fragment_wrapper = cloned_node
+        return cls
+
     def create_node(self, str tag):
         """Given an HTML tag name, e.g. `"div"`, create a single empty node for that tag,
         e.g. `"<div></div>"`.
@@ -1554,6 +1601,331 @@ cdef class LexborHTMLParser:
         dom_node = <lxb_dom_node_t *> element
 
         return LexborNode.new(dom_node, self)
+
+
+class LexborXMLParseError:
+    """One XML well-formedness violation recorded while parsing.
+
+    ``name`` is a short machine-readable id (``"tag_mismatch"``,
+    ``"unclosed_element"``, ...), ``id`` the corresponding
+    ``lxb_xml_error_id_t`` value, and ``offset``/``line``/``col`` locate the
+    violation in the input (byte offset, 1-based line and column).
+    """
+
+    __slots__ = ("id", "name", "offset", "line", "col")
+
+    def __init__(self, id, name, offset, line, col):
+        self.id = id
+        self.name = name
+        self.offset = offset
+        self.line = line
+        self.col = col
+
+    def __repr__(self):
+        return (f"<LexborXMLParseError {self.name} "
+                f"line={self.line} col={self.col} offset={self.offset}>")
+
+
+cdef class LexborXMLParser(LexborBaseParser):
+    """The lexbor XML parser.
+
+    Parses XML 1.0 into a Lexbor DOM tree. Unlike the HTML parser this is
+    strict by default: the first well-formedness violation raises
+    :class:`SelectolaxError` and the offending position is reported through
+    :attr:`errors`. Pass ``recover=True`` to collect violations instead and
+    keep the best-effort tree.
+
+    Element and attribute names are case-sensitive and namespace declarations
+    are resolved; use qualified names (``"xlink:href"``) in ``css()``,
+    ``tags()`` and attribute lookups.
+
+    Parameters
+    ----------
+    xml : str or bytes
+        XML content to parse. Bytes are parsed as UTF-8 (a UTF-8 BOM is
+        skipped; UTF-16 input is rejected).
+    is_fragment : bool, optional
+        Parse the input as XML element content - any number of top-level
+        nodes, comments and processing instructions - rather than a complete
+        document. Defaults to ``False``.
+    recover : bool, optional
+        When ``True``, well-formedness violations are recorded in
+        :attr:`errors` and the parser repairs the tree instead of failing:
+        unmatched end tags are ignored, unclosed elements are closed at EOF,
+        and malformed markup is kept as text where safe. Defaults to
+        ``False`` (strict).
+
+    Notes
+    -----
+    Not thread-safe: use one parser per thread, or lock the parser.
+    """
+
+    def __init__(
+        self,
+        xml: str | bytes,
+        is_fragment: bool = False,
+        recover: bool = False,
+    ):
+        cdef size_t xml_len
+        cdef object bytes_xml
+
+        self._is_fragment = is_fragment
+        self._fragment_wrapper = NULL
+        self._fragment_tag_id = LXB_TAG__UNDEF
+        self._fragment_namespace_id = LXB_NS__UNDEF
+        self._selector = None
+        self._recover = recover
+        self._errors = []
+        self._new_xml_document()
+        bytes_xml, xml_len = preprocess_input(xml)
+        self._parse_xml(bytes_xml, xml_len)
+        self.raw_html = bytes_xml
+
+    cdef inline void _new_xml_document(self):
+        """Initialize a fresh Lexbor XML document."""
+        with nogil:
+            self.document = lxb_xml_document_create()
+
+        if self.document == NULL:
+            PyErr_SetObject(SelectolaxError, "Failed to initialize object for XML Document.")
+
+        self.dom = &self.document.dom_document
+
+    cdef int _parse_xml(self, char *xml, size_t xml_len) except -1:
+        """Parse XML content into the internal document."""
+        cdef lxb_status_t status
+        cdef lxb_dom_document_fragment_t *frag
+        cdef const char *ename
+
+        if self.document == NULL:
+            return -1
+
+        self.document.recover = self._recover
+
+        with nogil:
+            if self._is_fragment:
+                frag = lxb_dom_document_create_document_fragment(self.dom)
+                if frag == NULL:
+                    status = LXB_STATUS_ERROR_MEMORY_ALLOCATION
+                else:
+                    self._fragment_wrapper = <lxb_dom_node_t *> frag
+                    status = lxb_xml_parse_fragment_into(
+                        self.dom, self._fragment_wrapper,
+                        <lxb_char_t *> xml, xml_len
+                    )
+            else:
+                status = lxb_xml_document_parse_ex(
+                    self.document, <lxb_char_t *> xml, xml_len,
+                    self._recover
+                )
+
+        self._collect_errors()
+
+        if status != LXB_STATUS_OK:
+            if self._errors:
+                err = self._errors[0]
+                PyErr_SetObject(
+                    SelectolaxError,
+                    f"Can't parse XML: {err.name} at line {err.line}, column {err.col}."
+                )
+            else:
+                PyErr_SetObject(SelectolaxError, "Can't parse XML.")
+            return -1
+
+        if self.document == NULL:
+            PyErr_SetObject(RuntimeError, "document is NULL even after xml was parsed correctly")
+            return -1
+        return 0
+
+    cdef void _collect_errors(self):
+        """Rebuild ``self._errors`` from the document's recorded violations."""
+        cdef lxb_xml_parse_error_t *errs
+        cdef size_t count = 0
+        cdef const char *ename
+
+        errors = []
+
+        errs = lxb_xml_document_parse_errors(self.document, &count)
+        for i in range(count):
+            ename = lxb_xml_error_name(errs[i].id)
+            errors.append(LexborXMLParseError(
+                <int> errs[i].id,
+                ename.decode('ascii'),
+                errs[i].offset,
+                errs[i].line,
+                errs[i].col,
+            ))
+
+        if not errors and self.document.first_error.id != LXB_XML_ERROR_OK:
+            fe = &self.document.first_error
+            ename = lxb_xml_error_name(fe.id)
+            errors.append(LexborXMLParseError(
+                <int> fe.id,
+                ename.decode('ascii'),
+                fe.offset,
+                fe.line,
+                fe.col,
+            ))
+
+        self._errors = errors
+
+    @property
+    def errors(self):
+        """Return the list of well-formedness violations recorded while parsing.
+
+        Empty when the document parsed cleanly. In strict mode a failed parse
+        raises, but the offending violation is still readable here if a parser
+        object survives (e.g. via ``try``/``except`` on a bound name); under
+        ``recover=True`` every violation the parser repaired is listed in
+        document order.
+
+        Returns
+        -------
+        list of LexborXMLParseError
+        """
+        return self._errors
+
+    @property
+    def recover(self):
+        """Return whether the parser ran in recovery mode."""
+        return self._recover
+
+    @property
+    def standalone(self):
+        """Return whether the XML declaration declared ``standalone="yes"``."""
+        if self.document == NULL:
+            return False
+        return <bint> self.document.standalone
+
+    def __dealloc__(self):
+        """Release the underlying Lexbor XML document."""
+        if self.document != NULL:
+            lxb_xml_document_destroy(self.document)
+
+    @staticmethod
+    cdef LexborXMLParser xml_from_document(lxb_xml_document_t *document, bytes raw_xml):
+        """Construct a parser from an existing Lexbor XML document."""
+        obj = <LexborXMLParser> LexborXMLParser.__new__(LexborXMLParser)
+        obj.document = document
+        obj.dom = &document.dom_document
+        obj.raw_html = raw_xml
+        obj.cached_script_texts = None
+        obj.cached_script_srcs = None
+        obj._is_fragment = False
+        obj._fragment_wrapper = NULL
+        obj._fragment_tag_id = LXB_TAG__UNDEF
+        obj._fragment_namespace_id = LXB_NS__UNDEF
+        obj._selector = None
+        obj._recover = <bint> document.recover
+        obj._errors = []
+        return obj
+
+    def clone(self):
+        """Clone the current document tree.
+
+        Tied to the current parser instance and destroyed with it.
+
+        Returns
+        -------
+        LexborXMLParser
+            A parser instance backed by a deep-copied document.
+        """
+        cdef lxb_xml_document_t* cloned_document
+        cdef lxb_dom_node_t* cloned_node
+        cdef lxb_dom_node_t* source_child
+        cdef lxb_dom_node_t* next_child
+        cdef LexborXMLParser cls
+
+        with nogil:
+            cloned_document = lxb_xml_document_create()
+
+        if cloned_document == NULL:
+            raise SelectolaxError("Can't create a new document")
+
+        try:
+            cloned_document.recover = self.document.recover
+
+            cloned_node = NULL
+
+            if self._is_fragment:
+                if self._fragment_root_node() != NULL:
+                    with nogil:
+                        cloned_node = lxb_dom_document_import_node(
+                            &cloned_document.dom_document,
+                            self._fragment_wrapper,
+                            <bint> True
+                        )
+                    if cloned_node == NULL:
+                        raise SelectolaxError("Can't create a new document")
+            else:
+                source_child = self.dom.node.first_child
+                while source_child != NULL:
+                    next_child = source_child.next
+                    with nogil:
+                        cloned_node = lxb_dom_document_import_node(
+                            &cloned_document.dom_document,
+                            source_child,
+                            <bint> True
+                        )
+                    if cloned_node == NULL:
+                        raise SelectolaxError("Can't create a new document")
+                    with nogil:
+                        lxb_dom_node_insert_child(
+                            <lxb_dom_node_t *> cloned_document, cloned_node
+                        )
+                    source_child = next_child
+
+            cls = LexborXMLParser.xml_from_document(cloned_document, self.raw_html)
+        except BaseException:
+            # Ownership of the document only moves to cls once it exists.
+            lxb_xml_document_destroy(cloned_document)
+            raise
+
+        if self._is_fragment:
+            cls._is_fragment = True
+            cls._fragment_wrapper = cloned_node
+        return cls
+
+    def create_node(self, str tag):
+        """Given an XML tag name, create a single empty element node for it.
+
+        The name is kept verbatim - case and any ``prefix:`` part included.
+
+        Parameters
+        ----------
+        tag : str
+            Name of the tag to create.
+
+        Returns
+        -------
+        LexborNode
+            Newly created element node.
+
+        Raises
+        ------
+        SelectolaxError
+            If the element cannot be created.
+        """
+        cdef lxb_dom_element_t* element
+        cdef lxb_dom_node_t* dom_node
+        if not tag:
+            raise SelectolaxError("Tag name cannot be empty")
+        pybyte_name = tag.encode('UTF-8')
+
+        element = lxb_dom_document_create_element(
+            self.dom,
+            <const lxb_char_t *> pybyte_name,
+            len(pybyte_name),
+            NULL
+        )
+
+        if element == NULL:
+            raise SelectolaxError(f"Can't create element for tag '{tag}'")
+
+        dom_node = <lxb_dom_node_t *> element
+
+        return LexborNode.new(dom_node, self)
+
 
 # Putting lexbor on python's heap is better than putting it
 # onto C's Heap, because python's Garbage collector can collect

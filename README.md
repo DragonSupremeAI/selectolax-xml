@@ -108,6 +108,33 @@ assert results[0].text() == "lexbor is AwesOme"
 
 * [More examples](https://selectolax.readthedocs.io/en/latest/examples.html)
 
+## Parsing XML
+
+`LexborXMLParser` applies the same DOM and CSS-selector API to XML documents.
+Unlike the HTML parser it is strict by default — malformed XML raises
+`SelectolaxError` — and it preserves case: `Item` and `item` are different
+elements, attributes keep their original spelling, and selectors match
+case-sensitively.
+
+```python
+from selectolax.lexbor import LexborXMLParser
+
+tree = LexborXMLParser('<catalog xmlns:p="urn:p"><p:item id="1">n</p:item></catalog>')
+print(tree.css_first('p\\:item').attributes)  # escaped colon selects by qualified name
+# {'id': '1'}
+print(tree.css_first('item').text())          # local name also works
+# 'n'
+```
+
+Pass `recover=True` to build a best-effort tree instead of raising; every
+violation the parser repaired is then listed in `parser.errors`
+(`LexborXMLParseError` records with `name`, `offset`, `line`, `col`).
+
+External entities and DTD processing are not performed: a `<!DOCTYPE>`
+declaration is preserved in the tree, but it is never fetched or expanded.
+Namespace prefixes are resolved during parsing, but CSS namespace
+selectors (`p|item`) are not supported — use `p\:item` or the local name.
+
 ## Simple Benchmark
 
 * Extract title, links, scripts and a meta tag from main pages of top 754 domains. See `examples/benchmark.py` for more information.

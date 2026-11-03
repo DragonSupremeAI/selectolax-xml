@@ -46,9 +46,9 @@ cdef inline lxb_dom_attr_t* _attr_by_qualified_name(
     reports the wrong value. Comparing the qualified name outright is what makes
     a lookup address exactly the attribute that iteration reports.
 
-    The comparison is ASCII case-insensitive because HTML matches attribute
-    names that way, and ``lxb_dom_attr_qualified_name()`` already lowercases
-    every unprefixed name.
+    The comparison is ASCII case-insensitive for HTML documents, whose
+    attribute names match that way, and exact for XML documents, which are
+    case-sensitive.
 
     Parameters
     ----------
@@ -68,11 +68,16 @@ cdef inline lxb_dom_attr_t* _attr_by_qualified_name(
     cdef lxb_dom_attr_t *attr = lxb_dom_element_first_attribute_noi(<lxb_dom_element_t *> node)
     cdef const lxb_char_t *qualified
     cdef size_t str_len = 0
+    cdef bint xml = node.owner_document.type == LXB_DOM_DOCUMENT_DTYPE_XML
 
     while attr != NULL:
         qualified = lxb_dom_attr_qualified_name(attr, &str_len)
-        if qualified != NULL and str_len == name_len and _ascii_ieq(name, qualified, name_len):
-            return attr
+        if qualified != NULL and str_len == name_len:
+            if xml:
+                if memcmp(name, qualified, name_len) == 0:
+                    return attr
+            elif _ascii_ieq(name, qualified, name_len):
+                return attr
         attr = attr.next
     return NULL
 
@@ -114,10 +119,10 @@ cdef class LexborAttributes:
     """A dict-like object that represents attributes."""
     cdef lxb_dom_node_t *node
     # Keeps the owning document alive. ``node`` is a borrowed pointer into
-    # ``parser.document``; without this reference the whole document is freed
+    # ``parser.dom``; without this reference the whole document is freed
     # as soon as the LexborNode that produced these attrs is collected, leaving
     # every method here reading freed memory.
-    cdef LexborHTMLParser parser
+    cdef LexborBaseParser parser
     cdef unicode decode_errors
 
     def __init__(self, *args, **kwargs):
@@ -127,7 +132,7 @@ cdef class LexborAttributes:
         )
 
     @staticmethod
-    cdef LexborAttributes create(lxb_dom_node_t *node, LexborHTMLParser parser):
+    cdef LexborAttributes create(lxb_dom_node_t *node, LexborBaseParser parser):
         if not _is_node_type(node, LXB_DOM_NODE_TYPE_ELEMENT):
             raise TypeError("attrs is only available for element nodes")
         obj = <LexborAttributes> LexborAttributes.__new__(LexborAttributes)

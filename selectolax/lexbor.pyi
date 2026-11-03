@@ -320,6 +320,31 @@ class LexborNode:
         text : str or None
         """
 
+    @property
+    def namespace_uri(self) -> str | None:
+        """Return the namespace URI the node belongs to.
+
+        ``None`` for non-element nodes, nodes in no namespace, and every node
+        of an HTML document. XML documents created by ``LexborXMLParser``
+        resolve ``xmlns`` declarations.
+        """
+
+    @property
+    def prefix(self) -> str | None:
+        """Return the namespace prefix of the node's qualified name.
+
+        ``None`` when the name has no prefix. For XML documents the prefix is
+        preserved verbatim; for HTML documents this is nearly always ``None``.
+        """
+
+    @property
+    def local_name(self) -> str | None:
+        """Return the node's name without its namespace prefix.
+
+        For ``<x:y>`` this returns ``"y"`` while :attr:`tag` returns ``"x:y"``.
+        ``None`` for non-element nodes.
+        """
+
     def decompose(self, recursive: bool = True) -> None:
         """Remove the current node from the tree.
 
@@ -1572,6 +1597,170 @@ def extract_html_comment(text: str) -> str:
         >>> extract_html_comment("<!-- hello -->")
         'hello'
     """
+
+class LexborXMLParseError:
+    """One XML well-formedness violation recorded while parsing.
+
+    ``name`` is a short machine-readable id (``"tag_mismatch"``,
+    ``"unclosed_element"``, ...), ``id`` the corresponding
+    ``lxb_xml_error_id_t`` value, and ``offset``/``line``/``col`` locate the
+    violation in the input (byte offset, 1-based line and column).
+    """
+
+    id: int
+    name: str
+    offset: int
+    line: int
+    col: int
+
+    def __init__(self, id: int, name: str, offset: int, line: int, col: int) -> None: ...
+
+
+class LexborXMLParser:
+    """The lexbor XML parser.
+
+    Parses XML 1.0 into a Lexbor DOM tree. Unlike the HTML parser this is
+    strict by default: the first well-formedness violation raises
+    :class:`SelectolaxError`. Pass ``recover=True`` to collect violations in
+    :attr:`errors` and keep the best-effort tree instead.
+
+    Element and attribute names are case-sensitive and namespace declarations
+    are resolved; select prefixed elements with an escaped colon
+    (``"xlink\\:href"``) or the local name (``"href"``) — CSS namespace
+    selectors (``"xlink|href"``) are not supported.
+    """
+
+    raw_html: bytes
+
+    def __init__(
+        self,
+        xml: str | bytes,
+        is_fragment: bool = False,
+        recover: bool = False,
+    ) -> None:
+        """Create a parser and load XML.
+
+        Parameters
+        ----------
+        xml : str or bytes
+            XML content to parse. Bytes are parsed as UTF-8 (a UTF-8 BOM is
+            skipped; UTF-16 input is rejected).
+        is_fragment : bool, optional
+            Parse the input as XML element content rather than a complete
+            document. Defaults to ``False``.
+        recover : bool, optional
+            Record violations in :attr:`errors` and repair the tree instead
+            of failing. Defaults to ``False`` (strict).
+        """
+
+    @property
+    def errors(self) -> list[LexborXMLParseError]:
+        """The well-formedness violations recorded while parsing."""
+
+    @property
+    def recover(self) -> bool:
+        """Whether the parser ran in recovery mode."""
+
+    @property
+    def standalone(self) -> bool:
+        """Whether the XML declaration declared ``standalone="yes"``."""
+
+    @property
+    def selector(self) -> LexborCSSSelector: ...
+
+    @property
+    def root(self) -> LexborNode | None:
+        """Return the document root node."""
+
+    def tags(self, name: str) -> list[LexborNode]:
+        """Return all tags that match the provided name (case-sensitive)."""
+
+    def text(
+        self,
+        deep: bool = True,
+        separator: str = "",
+        strip: bool = False,
+        skip_empty: bool = False,
+    ) -> str:
+        """Returns the text of the node including text of all its child nodes."""
+
+    @property
+    def html(self) -> str | None:
+        """Return the XML serialization of the document."""
+
+    def html_pretty(
+        self,
+        indent: int = 0,
+        skip_ws_nodes: bool = False,
+        skip_comment: bool = False,
+        raw: bool = False,
+        without_closing: bool = False,
+        tag_with_ns: bool = False,
+        without_text_indent: bool = False,
+        full_doctype: bool = False,
+        html5test: bool = False,
+    ) -> str | None:
+        """Return serialized XML of the document (pretty options are HTML-only)."""
+
+    def css(self, query: str) -> list[LexborNode]:
+        """A CSS selector. Names match case-sensitively."""
+
+    def css_first(
+        self, query: str, default: _DefaultT | None = None, strict: bool = False
+    ) -> LexborNode | _DefaultT | None:
+        """Same as `css` but returns only the first match."""
+
+    def strip_tags(self, tags: list[str], recursive: bool = False) -> None:
+        """Remove specified tags from the document."""
+
+    def select(self, query: str | None = None) -> LexborSelector | None:
+        """Select nodes given a CSS selector."""
+
+    def any_css_matches(self, selectors: tuple[str]) -> bool:
+        """Return ``True`` if any of the specified CSS selectors match."""
+
+    def scripts_contain(self, query: str) -> bool:
+        """Return ``True`` if any script tag contains the given text."""
+
+    def script_srcs_contain(self, queries: tuple[str]) -> bool:
+        """Return ``True`` if any script ``src`` contains one of the strings."""
+
+    def css_matches(self, selector: str) -> bool:
+        """Return ``True`` if the document matches the selector at least once."""
+
+    def template_fragments(self) -> list[LexborNode]:
+        """Always empty: XML has no template element."""
+
+    def merge_text_nodes(self) -> None:
+        """Merge adjacent text nodes."""
+
+    def clone(self) -> LexborXMLParser:
+        """Clone the current document tree."""
+
+    def unwrap_tags(self, tags: list[str], delete_empty: bool = False) -> None:
+        """Unwraps specified tags from the tree."""
+
+    @property
+    def inner_html(self) -> str:
+        """Return the XML serialization of the child nodes."""
+
+    def inner_html_pretty(
+        self,
+        indent: int = 0,
+        skip_ws_nodes: bool = False,
+        skip_comment: bool = False,
+        raw: bool = False,
+        without_closing: bool = False,
+        tag_with_ns: bool = False,
+        without_text_indent: bool = False,
+        full_doctype: bool = False,
+        html5test: bool = False,
+    ) -> str | None:
+        """Return serialized XML of the child nodes (pretty options are HTML-only)."""
+
+    def create_node(self, tag: str) -> LexborNode:
+        """Given an XML tag name, create a single empty element node for it."""
+
 
 class SelectolaxError(Exception):
     """An exception that indicates error."""

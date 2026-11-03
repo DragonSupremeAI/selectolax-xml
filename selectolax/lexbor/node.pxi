@@ -55,7 +55,7 @@ cdef lxb_dom_node_t *_node_to_insert(LexborNode target, LexborNode value, bint m
         return <lxb_dom_node_t *> value.node
 
     new_node = lxb_dom_document_import_node(
-        &target.parser.document.dom_document,
+        target.parser.dom,
         <lxb_dom_node_t *> value.node,
         <bint> True
     )
@@ -92,6 +92,18 @@ cdef inline void _replace_children(
     # addresses out again, so a retained view would read unrelated memory.
     cdef lxb_dom_node_t *wrapper
     cdef lxb_dom_node_t *child
+    cdef lxb_status_t status
+
+    if parent.owner_document.type == LXB_DOM_DOCUMENT_DTYPE_XML:
+        while parent.first_child != NULL:
+            lxb_dom_node_remove(parent.first_child)
+
+        status = lxb_xml_parse_fragment_into(
+            parent.owner_document, parent, html, html_len
+        )
+        if status != LXB_STATUS_OK:
+            raise SelectolaxError("Can't set inner HTML.")
+        return
 
     wrapper = lxb_html_document_parse_fragment(
         <lxb_html_document_t *> parent.owner_document,
@@ -129,7 +141,7 @@ cdef class LexborNode:
         self._is_fragment_root = 1
 
     @staticmethod
-    cdef LexborNode new(lxb_dom_node_t *node, LexborHTMLParser parser):
+    cdef LexborNode new(lxb_dom_node_t *node, LexborBaseParser parser):
         cdef LexborNode lxbnode = LexborNode.__new__(LexborNode)
         lxbnode.node = node
         lxbnode.parser = parser
@@ -221,7 +233,14 @@ cdef class LexborNode:
         lxb_str = lexbor_str_create()
         if lxb_str == NULL:
             raise MemoryError("Can't allocate memory for the output string.")
-        if self._is_template_content:
+        if self.node.owner_document.type == LXB_DOM_DOCUMENT_DTYPE_XML:
+            if self._is_template_content:
+                status = serialize_fragment_xml(<lxb_dom_node_t *> self.node.first_child, lxb_str)
+            elif self._is_fragment_root:
+                status = serialize_fragment_xml(self.node, lxb_str)
+            else:
+                status = lxb_xml_serialize_tree_str(self.node, lxb_str)
+        elif self._is_template_content:
             status = serialize_fragment(<lxb_dom_node_t *> self.node.first_child, lxb_str)
         elif self._is_fragment_root:
             status = serialize_fragment(self.node, lxb_str)
@@ -242,7 +261,15 @@ cdef class LexborNode:
         lxb_str = lexbor_str_create()
         if lxb_str == NULL:
             raise MemoryError("Can't allocate memory for the output string.")
-        if self._is_template_content:
+        if self.node.owner_document.type == LXB_DOM_DOCUMENT_DTYPE_XML:
+            # The XML serializer has no pretty mode; the options are HTML-only.
+            if self._is_template_content:
+                status = serialize_fragment_xml(<lxb_dom_node_t *> self.node.first_child, lxb_str)
+            elif self._is_fragment_root:
+                status = serialize_fragment_xml(self.node, lxb_str)
+            else:
+                status = lxb_xml_serialize_tree_str(self.node, lxb_str)
+        elif self._is_template_content:
             if pretty:
                 status = serialize_fragment_pretty(<lxb_dom_node_t *> self.node.first_child, lxb_str, options, indent)
             else:
@@ -272,7 +299,9 @@ cdef class LexborNode:
         lxb_str = lexbor_str_create()
         if lxb_str == NULL:
             raise MemoryError("Can't allocate memory for the output string.")
-        if pretty:
+        if self.node.owner_document.type == LXB_DOM_DOCUMENT_DTYPE_XML:
+            status = lxb_xml_serialize_deep_str(self.node, lxb_str)
+        elif pretty:
             status = lxb_html_serialize_pretty_deep_str(self.node, options, indent, lxb_str)
         else:
             status = lxb_html_serialize_deep_str(self.node, lxb_str)
@@ -412,7 +441,7 @@ cdef class LexborNode:
             # from the document's text memory arena, which is only released
             # wholesale by lxb_html_document_destroy(). Give it back here.
             lxb_dom_document_destroy_text_noi(
-                &self.parser.document.dom_document, text
+                self.parser.dom, text
             )
         return unicode_text
 
@@ -618,6 +647,88 @@ cdef class LexborNode:
             text = _decode_utf8(c_text, str_len)
         return text
 
+    @property
+    def namespace_uri(self):
+        """Return the namespace URI the node belongs to.
+
+        ``None`` for nodes that are not elements or attributes, for nodes in
+        no namespace, and for every node of an HTML document (XML documents
+        created by :class:`LexborXMLParser` resolve ``xmlns`` declarations).
+
+        Returns
+        -------
+        text : str or None
+        """
+        cdef const lxb_char_t *c_text
+        cdef size_t str_len = 0
+
+        if (self.node == NULL
+                or self.node.owner_document == NULL
+                or self.node.owner_document.type != LXB_DOM_DOCUMENT_DTYPE_XML
+                or self.node.ns == LXB_NS__UNDEF):
+            return None
+
+        c_text = lxb_ns_by_id(self.node.owner_document.ns, self.node.ns, &str_len)
+        if c_text == NULL or str_len == 0:
+            return None
+        return _decode_utf8(c_text, str_len)
+
+    @property
+    def prefix(self):
+        """Return the namespace prefix of the node's qualified name.
+
+        ``None`` when the name has no prefix. For XML documents the prefix is
+        preserved verbatim; for HTML documents this is nearly always ``None``.
+
+        Returns
+        -------
+        text : str or None
+        """
+        cdef const lxb_char_t *c_text
+        cdef const lxb_ns_prefix_data_t *prefix_data
+
+        if (self.node == NULL
+                or self.node.owner_document == NULL
+                or self.node.prefix == 0):
+            return None
+
+        prefix_data = lxb_ns_prefix_data_by_id(
+            self.node.owner_document.prefix,
+            <lxb_ns_prefix_id_t> self.node.prefix)
+        if (prefix_data == NULL or prefix_data.entry.length == 0
+                or prefix_data.entry.length > 1024):
+            return None
+
+        c_text = lexbor_hash_entry_str(&prefix_data.entry)
+        if c_text == NULL:
+            return None
+        return _decode_utf8(c_text, prefix_data.entry.length)
+
+    @property
+    def local_name(self):
+        """Return the node's name without its namespace prefix.
+
+        For ``<x:y>`` this returns ``"y"`` while :attr:`tag` returns ``"x:y"``.
+        Returns ``None`` for non-element nodes.
+
+        Returns
+        -------
+        text : str or None
+        """
+        cdef const lxb_char_t *c_text
+        cdef size_t str_len = 0
+
+        if (self.node == NULL
+                or not _is_node_type(self.node, LXB_DOM_NODE_TYPE_ELEMENT)
+                or self.node.local_name == LXB_TAG__UNDEF):
+            return None
+
+        c_text = lxb_tag_name_by_id_noi(<lxb_tag_id_t> self.node.local_name,
+                                        &str_len)
+        if c_text == NULL or str_len == 0:
+            return None
+        return _decode_utf8(c_text, str_len)
+
     def decompose(self, bool recursive=True):
         """Remove the current node from the tree.
 
@@ -634,7 +745,7 @@ cdef class LexborNode:
         >>>     tag.decompose()
 
         """
-        if self.node == <lxb_dom_node_t *> lxb_dom_document_root(&self.parser.document.dom_document):
+        if self.node == <lxb_dom_node_t *> lxb_dom_document_root(self.parser.dom):
             raise SelectolaxError("Decomposing the root node is not allowed.")
 
         if recursive:
@@ -642,7 +753,7 @@ cdef class LexborNode:
         else:
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
 
-        _maybe_refresh_head_body(self.parser.document, <lxb_dom_node_t *> self.node)
+        _maybe_refresh_head_body(self.parser.dom, <lxb_dom_node_t *> self.node)
         self.parser._mark_mutated()
 
     def strip_tags(self, list tags, bool recursive = False):
@@ -862,7 +973,7 @@ cdef class LexborNode:
             if delete_empty:
                 lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
                 _maybe_refresh_head_body(
-                    self.parser.document, <lxb_dom_node_t *> self.node
+                    self.parser.dom, <lxb_dom_node_t *> self.node
                 )
                 self.parser._mark_mutated()
             return
@@ -879,7 +990,7 @@ cdef class LexborNode:
             current_node = next_node
 
         lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
-        _maybe_refresh_head_body(self.parser.document, <lxb_dom_node_t *> self.node)
+        _maybe_refresh_head_body(self.parser.dom, <lxb_dom_node_t *> self.node)
         self.parser._mark_mutated()
 
     def unwrap_tags(self, list tags, bint delete_empty = False):
@@ -1042,7 +1153,7 @@ cdef class LexborNode:
         if isinstance(value, (str, bytes, unicode)):
             bytes_val = to_bytes(value)
             new_node = <lxb_dom_node_t *> lxb_dom_document_create_text_node(
-                &self.parser.document.dom_document,
+                self.parser.dom,
                 <lxb_char_t *> bytes_val, len(bytes_val)
             )
             if new_node == NULL:
@@ -1050,14 +1161,14 @@ cdef class LexborNode:
             lxb_dom_node_insert_before(self.node, new_node)
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
             _maybe_refresh_head_body(
-                self.parser.document, <lxb_dom_node_t *> self.node
+                self.parser.dom, <lxb_dom_node_t *> self.node
             )
         elif isinstance(value, LexborNode):
             new_node = _node_to_insert(self, value, move)
             lxb_dom_node_insert_before(self.node, new_node)
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
             _maybe_refresh_head_body(
-                self.parser.document, <lxb_dom_node_t *> self.node
+                self.parser.dom, <lxb_dom_node_t *> self.node
             )
         else:
             raise SelectolaxError("Expected a string or LexborNode instance, but %s found" % type(value).__name__)
@@ -1098,7 +1209,7 @@ cdef class LexborNode:
         if isinstance(value, (str, bytes, unicode)):
             bytes_val = to_bytes(value)
             new_node = <lxb_dom_node_t *> lxb_dom_document_create_text_node(
-                &self.parser.document.dom_document,
+                self.parser.dom,
                 <lxb_char_t *> bytes_val, len(bytes_val)
             )
             if new_node == NULL:
@@ -1146,7 +1257,7 @@ cdef class LexborNode:
         if isinstance(value, (str, bytes, unicode)):
             bytes_val = to_bytes(value)
             new_node = <lxb_dom_node_t *> lxb_dom_document_create_text_node(
-                &self.parser.document.dom_document,
+                self.parser.dom,
                 <lxb_char_t *> bytes_val, len(bytes_val)
             )
             if new_node == NULL:
@@ -1194,7 +1305,7 @@ cdef class LexborNode:
         if isinstance(value, (str, bytes, unicode)):
             bytes_val = to_bytes(value)
             new_node = <lxb_dom_node_t *> lxb_dom_document_create_text_node(
-                &self.parser.document.dom_document,
+                self.parser.dom,
                 <lxb_char_t *> bytes_val, len(bytes_val)
             )
             if new_node == NULL:
@@ -1481,7 +1592,7 @@ cdef class LexborNode:
         # without going through the insertion modes that normally keep the
         # document's cached head/body pointers valid, so recompute them.
         if lxb_dom_node_tag_id_noi(self.node) == LXB_TAG_HTML:
-            _refresh_head_body(self.parser.document)
+            _refresh_head_body(self.parser.dom)
 
         self.parser._mark_mutated()
 
@@ -1622,7 +1733,7 @@ cdef lexbor_action_t text_callback(lxb_dom_node_t *node, void *ctx):
     cdef TextContainer container = <TextContainer> ctx
     cdef lxb_tag_id_t tag_id = lxb_dom_node_tag_id_noi(node)
 
-    if tag_id != LXB_TAG__TEXT:
+    if tag_id != LXB_TAG__TEXT and node.type != LXB_DOM_NODE_TYPE_CDATA_SECTION:
         return LEXBOR_ACTION_OK
 
     if container.skip_empty and is_empty_text_node(node):
@@ -1645,6 +1756,17 @@ cdef lxb_status_t serialize_fragment(lxb_dom_node_t *node, lexbor_str_t *lxb_str
     cdef lxb_status_t status
     while node != NULL:
         status = lxb_html_serialize_tree_str(node, lxb_str)
+        if status != LXB_STATUS_OK:
+            return status
+        node = node.next
+
+    return LXB_STATUS_OK
+
+
+cdef lxb_status_t serialize_fragment_xml(lxb_dom_node_t *node, lexbor_str_t *lxb_str):
+    cdef lxb_status_t status
+    while node != NULL:
+        status = lxb_xml_serialize_tree_str(node, lxb_str)
         if status != LXB_STATUS_OK:
             return status
         node = node.next

@@ -1,5 +1,19 @@
 # selectolax Changelog
 
+# Unreleased
+
+- Add `LexborXMLParser`, a strict XML parser sharing the `LexborHTMLParser` DOM,
+  node, and CSS-selector API. XML names and attributes preserve case, and CSS
+  selectors match case-sensitively. Parsing is strict by default; pass
+  `recover=True` to build a best-effort tree and inspect `parser.errors` (a list
+  of `LexborXMLParseError` records with `name`, `offset`, `line`, `col`).
+  XML declarations, DOCTYPE, comments, processing instructions, CDATA sections
+  and namespace-prefixed names are preserved. External entities and DTD
+  processing are never performed. CSS namespace selectors (`ns|tag`) are not
+  supported; use `ns\:tag` or the local name.
+- `LexborNode.parser` now points to a shared `LexborBaseParser` base class.
+- Text extraction (`.text()`) now includes CDATA section content.
+
 # Version 1.0.2
 
 Bugfix release for 1.0.1.

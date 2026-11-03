@@ -289,12 +289,12 @@ cdef extern from "lexbor/html/html.h" nogil:
 cdef class LexborNode:
     cdef:
         lxb_dom_node_t *node
-        public LexborHTMLParser parser
+        public LexborBaseParser parser
         cdef bint _is_fragment_root
         cdef bint _is_template_content
 
     @staticmethod
-    cdef LexborNode new(lxb_dom_node_t *node, LexborHTMLParser parser)
+    cdef LexborNode new(lxb_dom_node_t *node, LexborBaseParser parser)
     cdef void set_as_fragment_root(self)
     cdef str _serialize_html(self, lxb_html_serialize_opt_t options, size_t indent, bint pretty)
     cdef str _serialize_inner_html(self, lxb_html_serialize_opt_t options, size_t indent, bint pretty)
@@ -319,31 +319,48 @@ cdef class LexborCSSSelector:
     cpdef list _find(self, str query, LexborNode node, bint only_first)
     cpdef int any_matches(self, str query, LexborNode node) except -1
 
-cdef class LexborHTMLParser:
-    cdef lxb_html_document_t *document
+cdef class LexborBaseParser:
+    """Shared state and tree operations for the HTML and XML parsers."""
+    cdef lxb_dom_document_t *dom
     cdef lxb_dom_node_t *_fragment_wrapper
     cdef bint _is_fragment
     cdef lxb_tag_id_t _fragment_tag_id
     cdef lxb_ns_id_t _fragment_namespace_id
     cdef public bytes raw_html
     cdef LexborCSSSelector _selector
-    cdef inline void _new_html_document(self)
+    cdef unsigned long _mutation_count
+    cdef object cached_script_texts
+    cdef object cached_script_srcs
     cdef inline lxb_dom_node_t* _fragment_root_node(self)
     cdef inline lxb_dom_node_t* _tag_search_root(self)
+    cdef inline LexborNode _fragment_content_node(self)
+    cdef void _replace_fragment_children(self, const lxb_char_t *html, size_t html_len) except *
+    cdef inline void _mark_mutated(self) noexcept
+
+
+cdef class LexborHTMLParser(LexborBaseParser):
+    cdef lxb_html_document_t *document
+    cdef inline void _new_html_document(self)
     cdef inline lxb_status_t _parse_html_document(self, char *html, size_t html_len) noexcept nogil
     cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(self, char *html, size_t html_len,
                                                      lxb_status_t *out_status) noexcept nogil
     cdef inline lxb_status_t _parse_html_fragment(self, char *html, size_t html_len) noexcept nogil
     cdef int _parse_html(self, char *html, size_t html_len) except -1
-    cdef inline LexborNode _fragment_content_node(self)
-    cdef void _replace_fragment_children(self, const lxb_char_t *html, size_t html_len) except *
-    cdef inline void _mark_mutated(self) noexcept
-    cdef unsigned long _mutation_count
-    cdef object cached_script_texts
-    cdef object cached_script_srcs
 
     @staticmethod
     cdef LexborHTMLParser from_document(lxb_html_document_t * document, bytes raw_html)
+
+
+cdef class LexborXMLParser(LexborBaseParser):
+    cdef lxb_xml_document_t *document
+    cdef bint _recover
+    cdef list _errors
+    cdef inline void _new_xml_document(self)
+    cdef int _parse_xml(self, char *xml, size_t xml_len) except -1
+    cdef void _collect_errors(self)
+
+    @staticmethod
+    cdef LexborXMLParser xml_from_document(lxb_xml_document_t *document, bytes raw_xml)
 
 cdef extern from "lexbor/html/encoding.h" nogil:
     ctypedef struct lxb_html_encoding_t:
@@ -483,7 +500,72 @@ cdef extern from "lexbor/dom/interfaces/element.h" nogil:
 
 
 cdef extern from "lexbor/dom/interfaces/document.h" nogil:
+    ctypedef struct lxb_dom_document_fragment_t
     lxb_html_document_t * lxb_html_document_destroy(lxb_html_document_t *document)
+    lxb_dom_document_fragment_t * lxb_dom_document_create_document_fragment(lxb_dom_document_t *document)
+    lxb_dom_element_t * lxb_dom_document_create_element(lxb_dom_document_t *document,
+                                                        const lxb_char_t *local_name, size_t lname_len,
+                                                        void *reserved_for_opt)
+
+
+cdef extern from "lexbor/xml/xml.h" nogil:
+    ctypedef enum lxb_xml_error_id_t:
+        LXB_XML_ERROR_OK = 0x00
+        LXB_XML_ERROR_UNEXPECTED_EOF
+        LXB_XML_ERROR_INVALID_CHAR
+        LXB_XML_ERROR_INVALID_NAME
+        LXB_XML_ERROR_TAG_MISMATCH
+        LXB_XML_ERROR_UNCLOSED_ELEMENT
+        LXB_XML_ERROR_MULTIPLE_ROOTS
+        LXB_XML_ERROR_MISSING_ROOT
+        LXB_XML_ERROR_UNEXPECTED_TEXT
+        LXB_XML_ERROR_INVALID_ATTR
+        LXB_XML_ERROR_DUPLICATE_ATTR
+        LXB_XML_ERROR_UNQUOTED_ATTR
+        LXB_XML_ERROR_INVALID_ENTITY
+        LXB_XML_ERROR_INVALID_CHARREF
+        LXB_XML_ERROR_UNBOUND_PREFIX
+        LXB_XML_ERROR_RESERVED_PREFIX
+        LXB_XML_ERROR_BAD_COMMENT
+        LXB_XML_ERROR_BAD_PI
+        LXB_XML_ERROR_BAD_CDATA
+        LXB_XML_ERROR_BAD_DOCTYPE
+        LXB_XML_ERROR_BAD_DECL
+        LXB_XML_ERROR_UNSUPPORTED_ENCODING
+        LXB_XML_ERROR_CONTENT_AFTER_ROOT
+        LXB_XML_ERROR_MEMORY
+        LXB_XML_ERROR_LAST_ENTRY
+
+    ctypedef struct lxb_xml_parse_error_t:
+        lxb_xml_error_id_t id
+        size_t offset
+        size_t line
+        size_t col
+
+    ctypedef struct lxb_xml_document_t:
+        lxb_dom_document_t dom_document
+        lexbor_array_obj_t *errors
+        lxb_xml_parse_error_t first_error
+        bint recover
+        bint standalone
+        bint decl_seen
+
+    lxb_xml_document_t * lxb_xml_document_create()
+    void lxb_xml_document_clean(lxb_xml_document_t *document)
+    lxb_xml_document_t * lxb_xml_document_destroy(lxb_xml_document_t *document)
+    lxb_status_t lxb_xml_document_parse(lxb_xml_document_t *document,
+                                        const lxb_char_t *data, size_t size)
+    lxb_status_t lxb_xml_document_parse_ex(lxb_xml_document_t *document,
+                                           const lxb_char_t *data, size_t size,
+                                           bint recover)
+    lxb_xml_parse_error_t * lxb_xml_document_parse_errors(lxb_xml_document_t *document,
+                                                          size_t *count)
+    const char * lxb_xml_error_name(lxb_xml_error_id_t id)
+    lxb_status_t lxb_xml_parse_fragment_into(lxb_dom_document_t *doc,
+                                           lxb_dom_node_t *parent,
+                                           const lxb_char_t *data, size_t size)
+    lxb_status_t lxb_xml_serialize_tree_str(lxb_dom_node_t *node, lexbor_str_t *str)
+    lxb_status_t lxb_xml_serialize_deep_str(lxb_dom_node_t *node, lexbor_str_t *str)
 
 
 cdef extern from "lexbor/dom/collection.h" nogil:
@@ -713,13 +795,30 @@ cdef extern from "lexbor/tag/tag.h" nogil:
     lxb_tag_id_t lxb_tag_id_by_name_noi(lexbor_hash_t *hash,
                                         const lxb_char_t *name,
                                         size_t len)
+    const lxb_char_t * lxb_tag_name_by_id_noi(lxb_tag_id_t tag_id, size_t *len)
+
+
+cdef extern from "lexbor/core/hash.h" nogil:
+    ctypedef union lxb_lexbor_hash_entry_str_u:
+        lxb_char_t *long_str
+        lxb_char_t[17] short_str
+
+    ctypedef struct lexbor_hash_entry_t:
+        lxb_lexbor_hash_entry_str_u u
+        size_t length
+        lexbor_hash_entry_t *next
+
+    lxb_char_t * lexbor_hash_entry_str(const lexbor_hash_entry_t *entry)
 
 
 cdef extern from "lexbor/ns/ns.h" nogil:
+    ctypedef uintptr_t lxb_ns_prefix_id_t
+
     ctypedef struct lxb_ns_data_t:
         lxb_ns_id_t ns_id
 
     ctypedef struct lxb_ns_prefix_data_t:
+        lexbor_hash_entry_t entry
         uintptr_t prefix_id
 
     ctypedef enum lxb_ns_id_enum_t:
@@ -739,6 +838,10 @@ cdef extern from "lexbor/ns/ns.h" nogil:
     const lxb_ns_prefix_data_t * lxb_ns_prefix_data_by_name(lexbor_hash_t *hash,
                                                             const lxb_char_t *name,
                                                             size_t length)
+    const lxb_ns_prefix_data_t * lxb_ns_prefix_data_by_id(lexbor_hash_t *hash,
+                                                          lxb_ns_prefix_id_t prefix_id)
+    const lxb_char_t * lxb_ns_by_id(lexbor_hash_t *hash, lxb_ns_id_t ns_id,
+                                  size_t *length)
 
 
 cdef extern from "lexbor/selectors/selectors.h" nogil:
